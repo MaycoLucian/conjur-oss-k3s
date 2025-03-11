@@ -81,5 +81,7 @@ conjur-ingress   traefik   conjur.poc   192.168.33.200   80, 443   14h
 ** Esse IP deve corresponder ao obtido com:
 ```bash
  kubectl get ingress conjur-ingress -n conjur-oss
+NAME             CLASS     HOSTS        ADDRESS          PORTS     AGE
+conjur-ingress   traefik   conjur.poc   192.168.33.200   80, 443   14h
 ```
 Com isso, seu ambiente estará pronto para usar o Conjur OSS! 🚀
