@@ -1,0 +1,219 @@
+---
+- name: Configurando Conjur OSS no K3s com persistência de dados e Ingress
+  hosts: localhost
+  become: yes
+  become_method: sudo
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Configurando variável de ambiente KUBECONFIG
+      shell: export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+    
+    - name: Instalando Helm
+      shell: curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+
+    - name: Adicionando repositório Helm cyberark
+      shell: helm repo add cyberark https://cyberark.github.io/helm-charts && helm repo update
+
+    - name: Criando diretório conjur se não existir
+      file:
+        path: ./conjur
+        state: directory
+
+    - name: Verificando se o arquivo 01_role-binding.yaml existe
+      stat:
+        path: ./conjur/01_role-binding.yaml
+      register: role_binding_file
+
+    - name: Criando arquivo 01_role-binding.yaml se não existir
+      copy:
+        dest: ./conjur/01_role-binding.yaml
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: conjur-role-binding
+            namespace: conjur-oss
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: conjur-role
+          subjects:
+          - kind: ServiceAccount
+            name: conjur-service-account
+            namespace: conjur-oss
+      when: not role_binding_file.stat.exists
+
+    - name: Criando Namespaces conjur-oss
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: conjur-oss
+      register: result
+      ignore_errors: yes
+
+    - name: Criando Namespace testapp
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: testapp
+
+    - name: Aplicando Role Binding
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('file', 'conjur/01_role-binding.yaml') }}"
+      register: result
+      ignore_errors: yes
+
+    - name: Criando PersistentVolume para PostgreSQL
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: pg-pv
+          spec:
+            capacity:
+              storage: 5Gi
+            volumeMode: Filesystem
+            accessModes:
+              - ReadWriteOnce
+            persistentVolumeReclaimPolicy: Retain
+            hostPath:
+              path: /mnt/data/postgresql
+
+    - name: Criando PersistentVolume para Conjur
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: conjur-pv
+          spec:
+            capacity:
+              storage: 1Gi
+            volumeMode: Filesystem
+            accessModes:
+              - ReadWriteOnce
+            persistentVolumeReclaimPolicy: Retain
+            hostPath:
+              path: /mnt/data/conjur
+
+    - name: Criando PersistentVolumeClaim para PostgreSQL
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: pg-pvc
+            namespace: conjur-oss
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 5Gi
+
+    - name: Criando PersistentVolumeClaim para Conjur
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: conjur-pvc
+            namespace: conjur-oss
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+
+    - name: Instalando o Conjur OSS com Helm
+      shell: >
+        helm install conjur-cluster cyberark/conjur-oss
+        --set ssl.hostname=conjur.poc,dataKey="$(docker run --rm cyberark/conjur data-key generate)",authenticators="authn-k8s/dev"
+        --set postgres.persistentVolume.create=false
+        --set service.external.enabled=false
+        --namespace conjur-oss
+    
+    - name: Aguardando até que o pod do Conjur esteja em estado Running
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: conjur-oss
+        label_selectors:
+          - "app=conjur-oss"
+          - "release=conjur-cluster"
+      register: pod_info
+      until: pod_info.resources | length > 0 and pod_info.resources[0].status.phase == "Running"
+      retries: 10
+      delay: 5
+
+    - name: Criando a Conta Padrão do Conjur
+      shell: >
+        export POD_NAME=$(kubectl get pods --namespace conjur-oss -l "app=conjur-oss,release=conjur-cluster" -o jsonpath="{.items[0].metadata.name}") &&
+        kubectl exec --namespace conjur-oss $POD_NAME --container=conjur-oss -- conjurctl account create myConjurAccount
+      register: conjur_account_output
+
+    - name: Exibindo a Admin API Key
+      debug:
+        msg: "{{ conjur_account_output.stdout }}"
+
+    - name: Gerando certificado autoassinado
+      shell: >
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout conjur/tls.key -out conjur/tls.crt -subj "/CN=conjur.pocl/O=local"
+      
+    - name: Criando Secret TLS no Kubernetes
+      shell: |
+        kubectl create secret tls conjur-tls \
+        --cert=conjur/tls.crt \
+        --key=conjur/tls.key \
+        -n conjur-oss
+
+    - name: Criando Ingress Resource
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: conjur-ingress
+            namespace: conjur-oss
+            annotations:
+              nginx.ingress.kubernetes.io/rewrite-target: /
+          spec:
+            rules:
+              - host: conjur.poc
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: conjur-cluster
+                          port:
+                            number: 443
+            tls:
+              - hosts:
+                  - conjur.poc
+                secretName: conjur-tls
+
+    - name: Configurando entrada DNS local no /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        state: present
+        line: "{{ lookup('pipe', 'kubectl get ingress conjur-ingress -n conjur-oss -o jsonpath=\"{.status.loadBalancer.ingress[0].ip}\"') }}  conjur.poc"
+      become: yes
