@@ -28,7 +28,7 @@ O **Conjur OSS (Open Source)** é uma solução de gerenciamento de segredos e c
 
 1. Aplique o manifesto do MetalLB
 ```bash
- kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/manifests/metallb.yaml
+ kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.4/config/manifests/metallb-native.yaml
 ```
 
 **Configure o Pool de IPs:** Crie um arquivo YAML para definir a faixa de IPs que o MetalLB usará:
